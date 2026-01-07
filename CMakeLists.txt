@@ -13,15 +13,20 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(asio)
 
+set(ASIO_INCLUDE_DIR ${asio_SOURCE_DIR}/asio/include CACHE PATH "Asio include directory" FORCE)
+
 FetchContent_Declare(
     crow
     GIT_REPOSITORY https://github.com/CrowCpp/Crow.git
     GIT_TAG master
 )
-
-set(ASIO_INCLUDE_DIR ${asio_SOURCE_DIR}/asio/include)
+set(CROW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(CROW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 
 FetchContent_MakeAvailable(crow)
+
+find_package(SQLite3 REQUIRED)
+find_package(Threads REQUIRED)
 
 include_directories(${crow_SOURCE_DIR}/include)
 include_directories(${asio_SOURCE_DIR}/asio/include)
@@ -33,10 +38,16 @@ endif()
 
 add_executable(todo_app main.cpp)
 
-find_package(Threads REQUIRED)
-
 if(WIN32)
-    target_link_libraries(todo_app PRIVATE Threads::Threads ws2_32 mswsock)
+    target_link_libraries(todo_app PRIVATE 
+        Threads::Threads 
+        ws2_32 
+        mswsock 
+        SQLite::SQLite3
+    )
 else()
-    target_link_libraries(todo_app PRIVATE Threads::Threads)
+    target_link_libraries(todo_app PRIVATE 
+        Threads::Threads 
+        SQLite::SQLite3
+    )
 endif()
