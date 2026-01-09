@@ -1,26 +1,10 @@
-#include <map>
-#include <mutex>
-#include <sqlite3.h>
-#include <string>
-#include <vector>
-
-#include "Common.h"
 #include "crow.h"
+#include "Common.h"
 
-#ifdef DELETE
-#undef DELETE
-#endif
-
-struct Task
-{
-    int id;
-    std::string title;
-    std::string description;
-    std::string status;
-};
 
 sqlite3 *db;
 std::mutex dbMutex;
+MemoryCache cache;
 
 bool executeSQL(const std::string &sql)
 {
@@ -28,7 +12,7 @@ bool executeSQL(const std::string &sql)
     int rc = sqlite3_exec(db, sql.c_str(), 0, 0, &errMsg);
     if (rc != SQLITE_OK)
     {
-        std::cerr << "SQL Error: " << errMsg << std::endl;
+        Logger::error(std::string("SQL Error: ") + errMsg);
         sqlite3_free(errMsg);
         return false;
     }
@@ -40,12 +24,13 @@ void initDB()
     int rc = sqlite3_open("todo.db", &db);
     if (rc)
     {
-        std::cerr << "Can't open database: " << sqlite3_errmsg(db) << std::endl;
+        Logger::error(std::string("Can't open database: ") +
+                      sqlite3_errmsg(db));
         exit(1);
     }
     else
     {
-        std::cout << "Opened database successfully" << std::endl;
+        Logger::info("Opened database successfully");
     }
 
     std::string sql = "CREATE TABLE IF NOT EXISTS tasks ("
@@ -66,13 +51,24 @@ int main()
 
     crow::SimpleApp app;
 
+    CROW_ROUTE(app, "/") ([]() { return HTML_CLIENT; });
+
+    CROW_ROUTE(app, "/metrics") ([]() { return Metrics::toJson(); });
+
     CROW_ROUTE(app, "/tasks")
         .methods(crow::HTTPMethod::POST)(
             [](const crow::request &req)
             {
+                Metrics::incrementRequests();
+                Logger::logRequest("POST", "/tasks");
+
                 auto x = crow::json::load(req.body);
                 if (!x)
+                {
+                    Metrics::recordError();
+                    Logger::error("Invalid JSON provided in POST");
                     return crow::response(400, "Invalid JSON");
+                }
 
                 std::string title = x["title"].s();
                 std::string desc = x["description"].s();
@@ -86,6 +82,9 @@ int main()
 
                 if (sqlite3_prepare_v2(db, sql, -1, &stmt, 0) != SQLITE_OK)
                 {
+                    Metrics::recordError();
+                    Logger::error("DB Prepare Error: " +
+                                  std::string(sqlite3_errmsg(db)));
                     return crow::response(500, sqlite3_errmsg(db));
                 }
 
@@ -96,11 +95,15 @@ int main()
                 if (sqlite3_step(stmt) != SQLITE_DONE)
                 {
                     sqlite3_finalize(stmt);
+                    Metrics::recordError();
+                    Logger::error("Failed to insert task");
                     return crow::response(500, "Failed to insert task");
                 }
 
                 int newId = (int)sqlite3_last_insert_rowid(db);
                 sqlite3_finalize(stmt);
+
+                cache.clear();
 
                 crow::json::wvalue result;
                 result["id"] = newId;
@@ -108,6 +111,9 @@ int main()
                 result["description"] = desc;
                 result["status"] = status;
 
+                Metrics::recordSuccess();
+                Logger::info("Task created successfully with ID: " +
+                             std::to_string(newId));
                 return crow::response(201, result);
             });
 
@@ -115,6 +121,19 @@ int main()
         .methods(crow::HTTPMethod::GET)(
             []()
             {
+                Metrics::incrementRequests();
+                Logger::logRequest("GET", "/tasks");
+
+                std::string cacheKey = "ALL_TASKS";
+                auto cachedValue = cache.get(cacheKey);
+                if (cachedValue)
+                {
+                    Metrics::recordSuccess();
+                    crow::response res(200, *cachedValue);
+                    res.set_header("Content-Type", "application/json");
+                    return res;
+                }
+
                 std::lock_guard<std::mutex> lock(dbMutex);
                 std::vector<crow::json::wvalue> tasksJsonList;
 
@@ -139,6 +158,11 @@ int main()
 
                 crow::json::wvalue result;
                 result = std::move(tasksJsonList);
+
+                std::string jsonStr = result.dump();
+                cache.set(cacheKey, jsonStr);
+
+                Metrics::recordSuccess();
                 return crow::response(200, result);
             });
 
@@ -146,6 +170,19 @@ int main()
         .methods(crow::HTTPMethod::GET)(
             [](int id)
             {
+                Metrics::incrementRequests();
+                Logger::logRequest("GET", "/tasks/" + std::to_string(id));
+
+                std::string cacheKey = "TASK_" + std::to_string(id);
+                auto cachedValue = cache.get(cacheKey);
+                if (cachedValue)
+                {
+                    Metrics::recordSuccess();
+                    crow::response res(200, *cachedValue);
+                    res.set_header("Content-Type", "application/json");
+                    return res;
+                }
+
                 std::lock_guard<std::mutex> lock(dbMutex);
                 sqlite3_stmt *stmt;
                 const char *sql = "SELECT id, title, description, status FROM "
@@ -179,7 +216,15 @@ int main()
                 sqlite3_finalize(stmt);
 
                 if (!found)
+                {
+                    Metrics::recordError();
+                    Logger::info("Task not found ID: " + std::to_string(id));
                     return crow::response(404, "Task not found");
+                }
+
+                cache.set(cacheKey, result.dump());
+
+                Metrics::recordSuccess();
                 return crow::response(200, result);
             });
 
@@ -187,9 +232,15 @@ int main()
         .methods(crow::HTTPMethod::PUT)(
             [](const crow::request &req, int id)
             {
+                Metrics::incrementRequests();
+                Logger::logRequest("PUT", "/tasks/" + std::to_string(id));
+
                 auto x = crow::json::load(req.body);
                 if (!x)
+                {
+                    Metrics::recordError();
                     return crow::response(400, "Invalid JSON");
+                }
 
                 std::string title = x["title"].s();
                 std::string desc = x["description"].s();
@@ -203,6 +254,7 @@ int main()
 
                 if (sqlite3_prepare_v2(db, sql, -1, &stmt, 0) != SQLITE_OK)
                 {
+                    Metrics::recordError();
                     return crow::response(500, "DB Error");
                 }
 
@@ -211,14 +263,19 @@ int main()
                 sqlite3_bind_text(stmt, 3, status.c_str(), -1, SQLITE_STATIC);
                 sqlite3_bind_int(stmt, 4, id);
 
-                int stepResult = sqlite3_step(stmt);
+                sqlite3_step(stmt);
                 sqlite3_finalize(stmt);
 
                 if (sqlite3_changes(db) == 0)
                 {
+                    Metrics::recordError();
                     return crow::response(404, "Task not found");
                 }
 
+                cache.clear();
+
+                Metrics::recordSuccess();
+                Logger::info("Task updated ID: " + std::to_string(id));
                 return crow::response(200, "Task updated");
             });
 
@@ -226,6 +283,9 @@ int main()
         .methods(crow::HTTPMethod::DELETE)(
             [](int id)
             {
+                Metrics::incrementRequests();
+                Logger::logRequest("DELETE", "/tasks/" + std::to_string(id));
+
                 std::lock_guard<std::mutex> lock(dbMutex);
 
                 sqlite3_stmt *stmt;
@@ -233,6 +293,7 @@ int main()
 
                 if (sqlite3_prepare_v2(db, sql, -1, &stmt, 0) != SQLITE_OK)
                 {
+                    Metrics::recordError();
                     return crow::response(500, "DB Error");
                 }
 
@@ -242,9 +303,14 @@ int main()
 
                 if (sqlite3_changes(db) == 0)
                 {
+                    Metrics::recordError();
                     return crow::response(404, "Task not found");
                 }
 
+                cache.clear();
+
+                Metrics::recordSuccess();
+                Logger::info("Task deleted ID: " + std::to_string(id));
                 return crow::response(200, "Task deleted");
             });
 
