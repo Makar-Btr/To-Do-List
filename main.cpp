@@ -51,8 +51,6 @@ int main()
 
     crow::SimpleApp app;
 
-    CROW_ROUTE(app, "/") ([]() { return HTML_CLIENT; });
-
     CROW_ROUTE(app, "/metrics") ([]() { return Metrics::toJson(); });
 
     CROW_ROUTE(app, "/tasks")

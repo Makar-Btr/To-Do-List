@@ -9,6 +9,4 @@
 #include "Logger.h"
 #include "Metrics.h"
 
-#include "WebClient.h"
-
 #undef DELETE
